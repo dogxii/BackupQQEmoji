@@ -1,172 +1,179 @@
 #!/usr/bin/env node
 
 const fs = require('fs');
+const fsPromises = fs.promises;
 const path = require('path');
-const { promisify } = require('util');
-
-const readFile = promisify(fs.readFile);
-const rename = promisify(fs.rename);
-const readdir = promisify(fs.readdir);
-const stat = promisify(fs.stat);
 
 /**
- * 检测图片文件的真实格式
- * @param {string} filePath 文件路径
- * @returns {string|null} 真实的文件格式 ('jpg', 'gif', 'png', 'webp' 等)
+ * 定义文件签名（Magic Numbers）
+ */
+const SIGNATURES = {
+    PNG: Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+    GIF89a: Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]), // GIF89a
+    GIF87a: Buffer.from([0x47, 0x49, 0x46, 0x38, 0x37, 0x61]), // GIF87a
+    JPG: Buffer.from([0xFF, 0xD8, 0xFF]),
+    BMP: Buffer.from([0x42, 0x4D]), // BM
+    WEBP_RIFF: Buffer.from([0x52, 0x49, 0x46, 0x46]), // RIFF
+    WEBP_WEBP: Buffer.from([0x57, 0x45, 0x42, 0x50]), // WEBP (offset 8)
+};
+
+/**
+ * 辅助：比较 Buffer 是否相等
+ */
+function bufferStartsWith(buffer, prefix) {
+    if (buffer.length < prefix.length) return false;
+    for (let i = 0; i < prefix.length; i++) {
+        if (buffer[i] !== prefix[i]) return false;
+    }
+    return true;
+}
+
+/**
+ * 高精度检测文件格式
  */
 async function detectImageFormat(filePath) {
+    let fileHandle = null;
     try {
-        // 只读取文件的前20个字节，足够识别大部分图片格式
-        const buffer = await readFile(filePath, { start: 0, end: 19 });
-        
-        // GIF 格式检测
-        if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
-            return 'gif';
+        fileHandle = await fsPromises.open(filePath, 'r');
+        // 读取前 32 个字节 (足以覆盖大部分文件头和检测 APNG 的 acTL 块)
+        const buffer = Buffer.alloc(32);
+        const { bytesRead } = await fileHandle.read(buffer, 0, 32, 0);
+
+        if (bytesRead < 8) return null;
+
+        // 1. 严格检测 PNG
+        if (bufferStartsWith(buffer, SIGNATURES.PNG)) {
+            // 进阶：虽然都是png，但我们可以简单看看有没有 acTL 块 (APNG特征)
+            // 这不影响后缀，但可以在日志里区分
+            const isApng = buffer.includes('acTL', 8, 'ascii');
+            return { ext: 'png', type: isApng ? 'APNG (动图)' : 'PNG' };
         }
-        
-        // JPEG 格式检测
-        if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
-            return 'jpg';
+
+        // 2. 严格检测 GIF (必须包含版本号 89a 或 87a)
+        if (bufferStartsWith(buffer, SIGNATURES.GIF89a) || bufferStartsWith(buffer, SIGNATURES.GIF87a)) {
+            return { ext: 'gif', type: 'GIF' };
         }
-        
-        // PNG 格式检测
-        if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
-            return 'png';
+
+        // 3. 检测 JPEG
+        if (bufferStartsWith(buffer, SIGNATURES.JPG)) {
+            return { ext: 'jpg', type: 'JPEG' };
         }
-        
-        // WebP 格式检测
-        if (buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
-            return 'webp';
+
+        // 4. 检测 WebP (RIFF + size + WEBP)
+        if (bufferStartsWith(buffer, SIGNATURES.WEBP_RIFF) && 
+            buffer.slice(8, 12).equals(SIGNATURES.WEBP_WEBP)) {
+            return { ext: 'webp', type: 'WebP' };
         }
-        
-        // BMP 格式检测
-        if (buffer[0] === 0x42 && buffer[1] === 0x4D) {
-            return 'bmp';
+
+        // 5. 检测 BMP
+        if (bufferStartsWith(buffer, SIGNATURES.BMP)) {
+            return { ext: 'bmp', type: 'BMP' };
         }
-        
-        // TIFF 格式检测
-        if ((buffer[0] === 0x49 && buffer[1] === 0x49 && buffer[2] === 0x2A && buffer[3] === 0x00) ||
-            (buffer[0] === 0x4D && buffer[1] === 0x4D && buffer[2] === 0x00 && buffer[3] === 0x2A)) {
-            return 'tiff';
-        }
-        
-        return null;
+
+        // 未知格式，返回文件头Hex供调试
+        return { 
+            ext: null, 
+            debugHex: buffer.slice(0, 8).toString('hex').toUpperCase() 
+        };
+
     } catch (error) {
-        console.error(`读取文件失败: ${filePath}`, error.message);
         return null;
+    } finally {
+        if (fileHandle) await fileHandle.close();
     }
 }
 
-/**
- * 获取文件扩展名（不包含点）
- * @param {string} filePath 文件路径
- * @returns {string} 扩展名
- */
-function getFileExtension(filePath) {
-    return path.extname(filePath).toLowerCase().substring(1);
-}
-
-/**
- * 处理单个目录中的所有图片文件
- * @param {string} dirPath 目录路径
- * @returns {Promise<{processed: number, renamed: number, errors: number}>}
- */
 async function processDirectory(dirPath) {
-    const stats = { processed: 0, renamed: 0, errors: 0 };
+    const stats = { processed: 0, renamed: 0, errors: 0, skipped: 0 };
     
     try {
-        const files = await readdir(dirPath);
-        
-        // 并发处理文件，但限制并发数量以避免文件系统压力
-        const batchSize = 10;
+        const files = await fsPromises.readdir(dirPath);
+        const batchSize = 20;
+
         for (let i = 0; i < files.length; i += batchSize) {
             const batch = files.slice(i, i + batchSize);
+            
             await Promise.all(batch.map(async (file) => {
+                if (file.startsWith('.')) return; // 跳过系统隐藏文件
+
                 const filePath = path.join(dirPath, file);
                 
                 try {
-                    const fileStat = await stat(filePath);
+                    const fileStat = await fsPromises.stat(filePath);
                     if (!fileStat.isFile()) return;
                     
-                    const currentExtension = getFileExtension(file);
+                    const result = await detectImageFormat(filePath);
                     
-                    // 只处理常见的图片扩展名
-                    const imageExtensions = ['jpg', 'jpeg', 'gif', 'png', 'webp', 'bmp', 'tiff'];
-                    if (!imageExtensions.includes(currentExtension)) return;
-                    
-                    stats.processed++;
-                    
-                    const actualFormat = await detectImageFormat(filePath);
-                    if (!actualFormat) {
-                        console.warn(`无法检测格式: ${file}`);
+                    // 无法识别格式的处理
+                    if (!result || !result.ext) {
+                        if (result && result.debugHex) {
+                            // 只有当文件看起来像乱码时才打印，避免刷屏
+                            // console.log(`[跳过] 未知格式: ${file} (Hex: ${result.debugHex})`);
+                        }
+                        stats.skipped++;
                         return;
                     }
+
+                    stats.processed++;
+                    const correctExt = result.ext;
                     
-                    // 需要重命名的情况
-                    const needsRename = (currentExtension !== actualFormat) && 
-                                       !(currentExtension === 'jpeg' && actualFormat === 'jpg') &&
-                                       !(currentExtension === 'jpg' && actualFormat === 'jpg');
+                    // 获取当前后缀（不带点）
+                    const currentExt = path.extname(file).replace('.', '').toLowerCase();
                     
-                    if (needsRename) {
-                        const newName = file.replace(/\.[^.]+$/, `.${actualFormat}`);
+                    // 判断是否需要重命名
+                    // 允许 jpeg = jpg
+                    const isCorrect = (currentExt === correctExt) || 
+                                      (currentExt === 'jpeg' && correctExt === 'jpg');
+
+                    if (!isCorrect) {
+                        // 保留原始文件名，只修改后缀
+                        const nameWithoutExt = path.parse(file).name;
+                        const newName = `${nameWithoutExt}.${correctExt}`;
                         const newPath = path.join(dirPath, newName);
                         
-                        // 检查目标文件是否已存在
-                        try {
-                            await stat(newPath);
-                            console.warn(`目标文件已存在，跳过重命名: ${file} -> ${newName}`);
-                            return;
-                        } catch (error) {
-                            // 目标文件不存在，可以重命名
+                        if (file !== newName) {
+                            // 检查目标是否存在
+                            try {
+                                await fsPromises.access(newPath);
+                                // console.warn(`[跳过] 目标已存在: ${newName}`);
+                            } catch (e) {
+                                await fsPromises.rename(filePath, newPath);
+                                console.log(`[修复] ${file} -> .${correctExt} \t[${result.type}]`);
+                                stats.renamed++;
+                            }
                         }
-                        
-                        await rename(filePath, newPath);
-                        console.log(`已重命名: ${file} -> ${newName} (${currentExtension} -> ${actualFormat})`);
-                        stats.renamed++;
-                    } else {
-                        console.log(`格式正确: ${file} (${actualFormat})`);
                     }
                 } catch (error) {
-                    console.error(`处理文件失败: ${file}`, error.message);
+                    console.error(`处理出错: ${file}`, error.message);
                     stats.errors++;
                 }
             }));
         }
     } catch (error) {
-        console.error(`读取目录失败: ${dirPath}`, error.message);
-        stats.errors++;
+        console.error(`目录无效: ${dirPath}`, error.message);
     }
     
     return stats;
 }
 
-/**
- * 主函数
- */
 async function main() {
     const args = process.argv.slice(2);
-    const targetDir = args[0] || './Ori';
+    const targetDir = args[0] || './Ori'; // 默认当前目录下的 Ori 文件夹
     
-    console.log(`开始处理目录: ${targetDir}`);
-    console.log('正在检测和修复图片文件格式...\n');
+    console.log(`正在扫描目录: ${targetDir}`);
+    console.log(`启用严格模式：精确区分 PNG/GIF/WebP ...\n`);
     
     const startTime = Date.now();
     const stats = await processDirectory(targetDir);
     const endTime = Date.now();
     
     console.log('\n=== 处理完成 ===');
-    console.log(`处理文件数: ${stats.processed}`);
-    console.log(`重命名文件数: ${stats.renamed}`);
-    console.log(`错误文件数: ${stats.errors}`);
-    console.log(`用时: ${(endTime - startTime)}ms`);
+    console.log(`有效图片: ${stats.processed}`);
+    console.log(`修复后缀: ${stats.renamed}`);
+    console.log(`跳过文件: ${stats.skipped} (非图片或未知格式)`);
+    console.log(`耗时: ${(endTime - startTime)}ms`);
 }
 
-// 如果直接运行此脚本
 if (require.main === module) {
-    main().catch(error => {
-        console.error('程序执行失败:', error);
-        process.exit(1);
-    });
-}
-
-module.exports = { detectImageFormat, processDirectory };
+    main();
+                                        }
